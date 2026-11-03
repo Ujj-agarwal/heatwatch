@@ -1,0 +1,324 @@
+#!/bin/bash
+# heatwatch — watch what is loading this Mac, and say clearly WHY when it is bad.
+#
+#   heatwatch               status: live load, today's timeline, the last problem
+#   heatwatch log [N]       the last N snapshots (default 16, about 8 hours)
+#   heatwatch reports       WARN/BAD reports, newest first, numbered
+#   heatwatch report [N]    show report N from that list (default 1 = newest, or a time: 1623)
+#   heatwatch explain [N]   Claude (Haiku, your logged-in account) names the cause and the fix
+#                           (--fresh to re-ask; HEATWATCH_MODEL=sonnet heatwatch explain for a deeper read)
+#   heatwatch now           take a snapshot now (10 s)
+#   heatwatch snap          the same, run every 30 minutes by launchd
+#
+# Snapshots come from ~/Library/LaunchAgents/com.ujjwal.heatwatch.plist and land in
+# ~/Library/Logs/heatwatch/: summary.log (one line per run) and report-<time>.txt (a full
+# report, only on WARN or BAD). explain caches its answer as explain-<time>.txt, so asking
+# about the same report twice costs nothing.
+#
+# BAD  = the machine is overloaded right now (will heat): load far above cores,
+#        a process using several cores, heavy swapping, or a thermal warning.
+# WARN = getting there: load above cores, swap nearly full, or a process that has
+#        been pinned at a full core for over an hour (a likely stuck/orphaned job).
+
+LOG_DIR="$HOME/Library/Logs/heatwatch"
+SUMMARY_LOG="$LOG_DIR/summary.log"
+mkdir -p "$LOG_DIR"
+
+if [ -t 1 ]; then
+    R0=$'\e[0m'; B=$'\e[1m'; DIM=$'\e[2m'; RED=$'\e[31m'; YEL=$'\e[33m'; GRN=$'\e[32m'
+else
+    R0=""; B=""; DIM=""; RED=""; YEL=""; GRN=""
+fi
+paint() {  # state word, padded to 4 so columns line up despite the colour codes
+    local c="$GRN"; [ "$1" = WARN ] && c="$YEL"; [ "$1" = BAD ] && c="$RED$B"
+    printf '%s%-4s%s' "$c" "$1" "$R0"
+}
+
+# Summary lines on stdin -> one compact row each: time, state, load, swap io, top, why.
+rows() {
+    awk -v red="$RED$B" -v yel="$YEL" -v grn="$GRN" -v r0="$R0" -v w="$(tput cols 2>/dev/null || echo 120)" '
+    {   split($0, f, "  ")
+        t = substr(f[1], 6); st = f[2]
+        load = f[3]; sub(/^load /, "", load); sub(/\/.*/, "", load)
+        top = f[4]; sub(/^top=/, "", top); sub(/^com\.apple\.Virtualization\./, "", top)
+        sio = f[6]; sub(/^swapio /, "", sio); sub(/\/s$/, "", sio)
+        why = ""; i = index($0, "  | "); if (i) why = substr($0, i + 4); gsub(/com\.apple\.Virtualization\./, "", why)
+        if (w > 90) why = substr(why, 1, w - 78)
+        c = (st == "BAD") ? red : (st == "WARN") ? yel : grn
+        printf "%s  %s%-4s%s  load %5s  swap-io %-9s  %-24s  %s\n", t, c, st, r0, load, sio, substr(top, 1, 24), why
+    }'
+}
+
+pick_report() {  # "" or 1..99 = position in `heatwatch reports`; anything else = part of the time
+    local sel="${1:-1}"
+    if [[ "$sel" =~ ^[0-9]{1,2}$ ]]; then
+        ls -t "$LOG_DIR"/report-*.txt 2>/dev/null | sed -n "${sel}p"
+    else
+        ls -t "$LOG_DIR"/report-*"$sel"*.txt 2>/dev/null | head -1
+    fi
+}
+
+cmd_status() {
+    local cores l swap comp batt busy state last today lines n_ok n_warn n_bad strip lc
+    cores=$(sysctl -n hw.ncpu)
+    read l _ _ <<<"$(sysctl -n vm.loadavg | tr -d '{}')"
+    swap=$(sysctl -n vm.swapusage | awk '{gsub("M","",$3); gsub("M","",$6); printf "%d/%d MB", $6, $3}')
+    comp=$(vm_stat | awk '/occupied by compressor/{printf "%.1f", $NF*16384/1073741824}')
+    batt=$(pmset -g batt | awk -F'\t' 'NR==2{split($2,a,";"); print a[1] a[2]}' | tr -s ' ')
+    busy=$(ps -axo %cpu=,comm= -r | head -3 | awk '{n=$2; for(i=3;i<=NF;i++) n=n" "$i; sub(".*/","",n); sub(/^com\.apple\.Virtualization\./,"",n); printf "%s %d%%   ", n, $1}')
+    lc="$GRN"; awk -v a="$l" -v b="$cores" 'BEGIN{exit !(a>b)}' && lc="$YEL"; awk -v a="$l" -v b="$((cores*2))" 'BEGIN{exit !(a>b)}' && lc="$RED$B"
+
+    echo "${B}now${R0}    load ${lc}$l${R0} on $cores cores · swap $swap · compressed ${comp} GB · $batt"
+    echo "       busiest: $busy"
+    pgrep -f Virtualization.VirtualMachine >/dev/null && echo "       ${YEL}a VM is running (Docker or similar); its load hides behind one process${R0}"
+
+    state=$(launchctl print "gui/$(id -u)/com.ujjwal.heatwatch" 2>/dev/null | awk '$1=="state"{print $3; exit}')
+    last=$(tail -1 "$SUMMARY_LOG" 2>/dev/null | cut -c12-16)
+    if [ -n "$state" ]; then
+        echo "${B}watch${R0}  running every 30 min · last snapshot ${last:-none}"
+    else
+        echo "${B}watch${R0}  ${RED}${B}NOT LOADED${R0} — launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.ujjwal.heatwatch.plist"
+    fi
+
+    today=$(date +%F)
+    lines=$(grep "^$today" "$SUMMARY_LOG" 2>/dev/null)
+    if [ -n "$lines" ]; then
+        n_ok=$(echo "$lines" | grep -c "  OK  "); n_warn=$(echo "$lines" | grep -c "  WARN  "); n_bad=$(echo "$lines" | grep -c "  BAD  ")
+        strip=$(echo "$lines" | awk -v red="$RED" -v yel="$YEL" -v grn="$GRN" -v r0="$R0" '{c=($3=="BAD")?red:($3=="WARN")?yel:grn; printf "%s█%s", c, r0}')
+        echo "${B}today${R0}  $strip  $(echo "$lines" | head -1 | cut -c12-16)→$(echo "$lines" | tail -1 | cut -c12-16) · ${GRN}$n_ok OK${R0} · ${YEL}$n_warn WARN${R0} · ${RED}$n_bad BAD${R0}"
+    fi
+
+    last=$(grep -E "  (WARN|BAD)  " "$SUMMARY_LOG" 2>/dev/null | tail -1)
+    [ -n "$last" ] && { echo "${B}last problem${R0}"; echo "$last" | rows | sed 's/^/  /'; }
+    echo "${DIM}heatwatch log · reports · report [N] · explain [N] · help${R0}"
+}
+
+cmd_log() {
+    [ -s "$SUMMARY_LOG" ] || { echo "no snapshots yet"; return; }
+    tail -n "${1:-16}" "$SUMMARY_LOG" | rows
+}
+
+cmd_reports() {
+    local i=0 f st t why ex
+    for f in $(ls -t "$LOG_DIR"/report-*.txt 2>/dev/null | head -"${1:-15}"); do
+        i=$((i+1))
+        st=$(head -1 "$f" | awk '{print $2}')
+        t=$(head -1 "$f" | sed 's/.*— ....-//')
+        why=$(sed -n 2p "$f" | sed 's/^why: //' | sed -E 's/com\.apple\.Virtualization\.//g' | cut -c1-90)
+        ex=""; [ -s "$LOG_DIR/explain-${f##*/report-}" ] && ex=" ${DIM}· explained${R0}"
+        printf "%2d  %s  %s  %s%s\n" "$i" "$t" "$(paint "$st")" "$why" "$ex"
+    done
+    [ $i = 0 ] && echo "no WARN/BAD reports yet"
+}
+
+EXPLAIN_SYSTEM="You diagnose why a MacBook (Apple M4, 10 cores, 16 GB RAM) is overloaded and heating, from a heatwatch report. Reply in at most 6 short plain-text lines, no markdown, exactly these labels:
+CAUSE: the specific process or job responsible, with the numbers that prove it.
+STARTED BY: what launched it (Claude session PID and folder, an app, or orphaned), read from the chain lines.
+WHY HOT: one line on the mechanism (CPU oversubscription, swap thrashing, a stuck loop, ...).
+DO NOW: the exact command(s) to stop the real culprit, using PIDs or container names from the report. Never suggest killing kernel_task, WindowServer, launchd, or a com.apple.Virtualization / Docker VM process: that is the VM host, so stop the containers (docker stop <name>) or the session's job instead.
+PREVENT: one concrete change that the report does not show is already in place.
+Base CAUSE and DO NOW on THIS report's numbers; the snapshots only show the trend. Use only facts given; never guess. If nothing is abnormal, say so in one line."
+
+cmd_explain() {
+    local fresh=0 r cache when trend out
+    [ "$1" = "--fresh" ] && { fresh=1; shift; }
+    r=$(pick_report "$1")
+    [ -z "$r" ] && { echo "no WARN/BAD report to explain"; return 1; }
+    cache="$LOG_DIR/explain-${r##*/report-}"
+    echo "${B}$(head -1 "$r")${R0}"
+    if [ $fresh = 0 ] && [ -s "$cache" ]; then
+        cat "$cache"; echo "${DIM}(cached · heatwatch explain --fresh ${1:-1} to ask again)${R0}"; return
+    fi
+    command -v claude >/dev/null || { echo "claude CLI not found on PATH"; return 1; }
+    # The trend up to the report, so a slow build-up reads differently from a sudden spike.
+    when=$(head -1 "$r" | sed 's/.*— //')
+    trend=$(awk -v w="$when" 'substr($0,1,16) <= w' "$SUMMARY_LOG" | tail -6)
+    echo "${DIM}asking Claude (${HEATWATCH_MODEL:-haiku})...${R0}"
+    # Lean on purpose: no tools, no MCP, no skills, no settings or hooks, no saved session.
+    # Run from the log folder so no project CLAUDE.md is pulled in. Bills to the logged-in account.
+    out=$(cd "$LOG_DIR" && printf 'Recent snapshots (oldest first):\n%s\n\nFull report:\n%s\n' "$trend" "$(cat "$r")" |
+        claude -p --model "${HEATWATCH_MODEL:-haiku}" --effort low --tools "" --strict-mcp-config --disable-slash-commands \
+            --no-session-persistence --setting-sources "" --system-prompt "$EXPLAIN_SYSTEM" \
+            --output-format json 2>&1)
+    printf '%s' "$out" | python3 -I -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if d.get("is_error") or not d.get("result"):
+    sys.exit(1)
+u = d.get("usage") or {}
+tok = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"))
+cost = d.get("total_cost_usd") or 0
+open(sys.argv[1], "w").write(d["result"].strip() + "\n")
+print(f"{tok} tokens · ~${cost:.4f} API-equivalent, billed to your subscription", file=sys.stderr)
+' "$cache" 2>"$LOG_DIR/.usage" || { echo "${RED}Claude call failed:${R0} $(printf '%s' "$out" | tail -c 300)"; return 1; }
+    [ -t 1 ] && printf '\e[1A\e[2K'   # drop the "asking" line
+    cat "$cache"
+    echo "${DIM}$(cat "$LOG_DIR/.usage")${R0}"
+}
+
+case "${1:-status}" in
+    status)          cmd_status; exit ;;
+    log)             cmd_log "$2"; exit ;;
+    reports)         cmd_reports "$2"; exit ;;
+    report|--last)   r=$(pick_report "$2"); [ -n "$r" ] && cat "$r" || echo "no such report (see: heatwatch reports)"; exit ;;
+    explain)         shift; cmd_explain "$@"; exit ;;
+    help|-h|--help)  sed -n '2,/^$/p' "$0" | sed -E 's/^# ?//'; exit ;;
+    now|snap)        ;;  # falls through to the snapshot below
+    *)               echo "unknown command: $1 (try: heatwatch help)"; exit 1 ;;
+esac
+
+CORES=$(sysctl -n hw.ncpu)
+NOW=$(date "+%Y-%m-%d %H:%M")
+STAMP=$(date "+%Y%m%d-%H%M")
+
+# ---- measurements ----------------------------------------------------------
+read L1 L5 L15 <<<"$(sysctl -n vm.loadavg | tr -d '{}')"
+
+vmcounts() { vm_stat | awk '/Swapins/{a=$NF}/Swapouts/{b=$NF}/^Compressions/{c=$NF}END{print a+0,b+0,c+0}'; }
+read SI0 SO0 C0 <<<"$(vmcounts)"
+# A 10 s top sample doubles as the swap-rate window. CPU % is per core: 300 = three cores.
+TOP=$(top -l 2 -s 10 -o cpu -n 12 -stats pid,ppid,cpu,mem,time,command | awk '/^PID/{n++} n==2')
+read SI1 SO1 C1 <<<"$(vmcounts)"
+SWAPIN=$(( (SI1 - SI0) / 10 )); SWAPOUT=$(( (SO1 - SO0) / 10 )); COMPRESS=$(( (C1 - C0) / 10 ))
+
+SWAP_USED=$(sysctl -n vm.swapusage | awk '{gsub("M","",$6); print int($6)}')
+SWAP_TOTAL=$(sysctl -n vm.swapusage | awk '{gsub("M","",$3); print int($3)}')
+COMPRESSED_GB=$(vm_stat | awk '/occupied by compressor/{printf "%.1f", $NF*16384/1073741824}')
+MEMFREE=$(memory_pressure 2>/dev/null | awk '/free percentage/{gsub("%","",$NF); print $NF}')
+KERNEL_CPU=$(echo "$TOP" | awk '$1==0{print int($3)}')
+BATT=$(pmset -g batt | awk -F'\t' 'NR==2{split($2,a,";"); print a[1] a[2]}' | tr -s ' ')
+THERM=$(pmset -g therm | grep -v "^Note: No" | grep -iE "warning|limit" | tr '\n' ' ')
+TOP_PID=$(echo "$TOP" | awk '$1 ~ /^[0-9]+$/ && $1!=0{print $1; exit}')
+TOP_CPU=$(echo "$TOP" | awk '$1 ~ /^[0-9]+$/ && $1!=0{print int($3); exit}')
+TOP_CMD=$(basename "$(ps -o comm= -p "$TOP_PID" 2>/dev/null)" 2>/dev/null)
+
+# Up over an hour and averaging >= 80% of a core across its WHOLE life: the stuck-ffmpeg
+# pattern. Lifetime CPU time / elapsed time, because ps %cpu is a short decaying average
+# and flags anything that merely spiked. Prints: pid ppid avg% etime comm.
+STUCK=$(ps -axo pid=,ppid=,etime=,time=,comm= | awk '
+    function secs(t,   d, n, a, s, i) {
+        d = 0; if (t ~ /-/) { split(t, a, "-"); d = a[1]; t = a[2] }
+        n = split(t, a, ":"); s = 0; for (i = 1; i <= n; i++) s = s * 60 + a[i]
+        return d * 86400 + s
+    }
+    { e = secs($3); c = secs($4); if (e >= 3600 && c / e >= 0.8) printf "%s %s %d %s %s\n", $1, $2, 100 * c / e, $3, $5 }')
+
+# ---- verdict ---------------------------------------------------------------
+STATE=OK; REASONS=""
+add() { REASONS="${REASONS:+$REASONS; }$1"; }
+gt() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'; }
+
+if gt "$L1" $(( CORES * 2 )); then STATE=BAD; add "load $L1 on $CORES cores"; fi
+if [ "${TOP_CPU:-0}" -ge 250 ]; then STATE=BAD; add "$TOP_CMD ($TOP_PID) at ${TOP_CPU}% CPU"; fi
+if [ "$SWAPOUT" -ge 500 ] || [ "$SWAPIN" -ge 1000 ]; then STATE=BAD; add "swap thrashing (in $SWAPIN/s, out $SWAPOUT/s)"; fi
+if [ -n "$THERM" ]; then STATE=BAD; add "thermal: $THERM"; fi
+if [ "$STATE" != BAD ]; then
+    if gt "$L1" "$CORES"; then STATE=WARN; add "load $L1 above $CORES cores"; fi
+    if [ "$SWAP_TOTAL" -gt 0 ] && [ $(( SWAP_USED * 100 / SWAP_TOTAL )) -ge 85 ]; then STATE=WARN; add "swap ${SWAP_USED}/${SWAP_TOTAL} MB"; fi
+    if [ "${KERNEL_CPU:-0}" -ge 40 ]; then STATE=WARN; add "kernel_task ${KERNEL_CPU}% (memory compression or thermal throttling)"; fi
+fi
+if [ -n "$STUCK" ]; then
+    [ "$STATE" = OK ] && STATE=WARN
+    add "pinned >1h: $(echo "$STUCK" | awk '{n=$5; sub(".*/","",n); printf "%s(%s) ", n, $1}')"
+fi
+
+SUMMARY="$NOW  $STATE  load $L1/$L5/$L15  top=$TOP_CMD:${TOP_CPU}%  swap ${SWAP_USED}M  swapio ${SWAPIN}/${SWAPOUT}/s  compressed ${COMPRESSED_GB}G  batt $BATT${REASONS:+  | $REASONS}"
+echo "$SUMMARY" >> "$SUMMARY_LOG"
+echo "$SUMMARY" | rows
+
+[ -n "$HEATWATCH_TEST" ] && { STATE=WARN; add "test run"; }
+[ "$STATE" = OK ] && exit 0
+
+# ---- full report: name the culprits and who started them --------------------
+# Walk the parent chain up to the owning app or Claude session, with its folder.
+chain() {
+    local p=$1 out="" i=0 c path=""
+    while [ -n "$p" ] && [ "$p" -gt 1 ] && [ $i -lt 8 ]; do
+        path=$(ps -o comm= -p "$p" 2>/dev/null)
+        c=$(basename "$path" 2>/dev/null)
+        [ -z "$c" ] && break
+        out="$out <- $c($p)"
+        case "$c" in
+            claude) out="$out [session folder: $(cwd $p)]"; break ;;
+            *.app|Terminal|Code|Electron) break ;;
+        esac
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); i=$((i+1))
+    done
+    # Apps, XPC services and system daemons are ALWAYS children of launchd; only a tool
+    # like ffmpeg or python sitting under launchd has really lost its parent.
+    if [ "$p" = 1 ]; then
+        case "$path" in
+            *Virtualization*) out="$out <- launchd (macOS VM host for Docker Desktop or similar, NOT orphaned: stop its containers, never kill it)" ;;
+            /System/*|/usr/libexec/*|/usr/sbin/*|*.app/*|*.xpc/*) out="$out <- launchd (started by macOS, normal)" ;;
+            *) out="$out <- launchd (ORPHANED: its parent is gone)" ;;
+        esac
+    fi
+    echo "${out# <- }"
+}
+cwd() { lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | sed "s|$HOME|~|"; }
+
+R="$LOG_DIR/report-$STAMP.txt"
+{
+    echo "heatwatch $STATE — $NOW"
+    echo "why: $REASONS"
+    echo
+    echo "load $L1 / $L5 / $L15 on $CORES cores | battery $BATT"
+    echo "memory: ${MEMFREE}% free (pressure) | compressed ${COMPRESSED_GB} GB | swap ${SWAP_USED}/${SWAP_TOTAL} MB"
+    echo "swap rate: in $SWAPIN/s out $SWAPOUT/s | compressions $COMPRESS/s | kernel_task ${KERNEL_CPU}%"
+    echo
+    echo "== top CPU over 10s (100% = one core) =="
+    echo "$TOP"
+    echo
+    echo "== who the top CPU users are =="
+    echo "$TOP" | awk '$1!=0 && $3>=20{print $1}' | head -6 | while read p; do
+        echo "PID $p  [$(ps -o etime= -p $p 2>/dev/null | tr -d ' ') running]  folder: $(cwd $p)"
+        echo "  cmd:   $(ps -o args= -p $p 2>/dev/null | cut -c1-300)"
+        echo "  chain: $(chain $p)"
+    done
+    if [ -n "$STUCK" ]; then
+        echo; echo "== pinned at >= 1 core for over an hour (likely stuck) =="
+        echo "$STUCK" | while read p pp cpu et c; do
+            echo "PID $p  ${cpu}%  up $et  folder: $(cwd $p)"
+            echo "  cmd:   $(ps -o args= -p $p 2>/dev/null | cut -c1-300)"
+            echo "  chain: $(chain $p)"
+        done
+    fi
+    echo
+    echo "== heavy job families running now =="
+    for pat in "ffmpeg" "m pytest" "docker compose.* run" "hyperframes" "chrome-headless|headless_shell" "whisper" "app.worker" "claude -p" "kiro-cli"; do
+        n=$(pgrep -f "$pat" | wc -l | tr -d ' ')
+        [ "$n" -gt 0 ] && echo "$n x $pat"
+    done
+    # THE DOCKER VM SHOWS UP AS ONE ORPHANED "com.apple.Virtualization.VirtualMachine", which
+    # names nothing. Break it down by container, and name the session driving each test run.
+    DOCKER=/Applications/Docker.app/Contents/Resources/bin/docker
+    if [ -S "$HOME/.docker/run/docker.sock" ] && [ -x "$DOCKER" ] && pgrep -f Virtualization.VirtualMachine >/dev/null; then
+        echo
+        echo "== Docker containers (CPU here is inside the VM) =="
+        "$DOCKER" stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' 2>&1 | head -15
+        pgrep -f "docker compose.* run|docker run" | while read p; do
+            echo "PID $p [$(ps -o etime= -p $p 2>/dev/null | tr -d ' ')]  $(ps -o args= -p $p 2>/dev/null | cut -c1-160)"
+            echo "  chain: $(chain $p)"
+        done
+    fi
+    echo
+    echo "== memory by app (footprint incl. compressed) =="
+    top -l 1 -o mem -n 400 -stats command,mem | awk 'f{print} /^COMMAND/{f=1}' | awk '{m=$NF; v=m+0; if(m~/G/)v*=1024; else if(m~/K/)v/=1024;
+        c=$1; if(c~/^Brave/)k="Brave"; else if(c~/^Google/)k="Chrome"; else if(c~/^2\.[0-9]+\./||c~/^claude/)k="claude sessions"; else if(c~/Python/)k="Python"; else if(c~/ffmpeg/)k="ffmpeg"; else if(c~/node|next|npm|bun/)k="node/next/bun"; else if(c~/Spotify/)k="Spotify"; else if(c~/Slack/)k="Slack"; else if(c~/Terminal/)k="Terminal"; else if(c~/WindowServer/)k="WindowServer"; else if(c~/postgres/)k="postgres"; else k="other";
+        s[k]+=v; n[k]++} END{for(k in s) printf "%6.1f GB  %3d procs  %s\n", s[k]/1024, n[k], k}' | sort -nr | head -10
+    echo
+    echo "claude sessions open: $(ps -axo comm= | grep -cE '(^|/)claude$')"
+} > "$R"
+# Command lines carry connection strings; keep passwords out of the log.
+sed -i '' -E 's#(://[^:/@ ]+:)[^@ ]*#\1***#g' "$R"
+
+if [ "$STATE" = BAD ]; then
+    osascript -e "display notification \"$(echo "$REASONS" | cut -c1-180 | tr -d '\"')\" with title \"Mac overloaded — heatwatch\" subtitle \"Report: report-$STAMP.txt\"" 2>/dev/null
+fi
+
+# Keep two weeks of reports and a bounded summary.
+find "$LOG_DIR" -name 'report-*.txt' -mtime +14 -delete 2>/dev/null
+tail -n 2000 "$LOG_DIR/summary.log" > "$LOG_DIR/.s" && mv "$LOG_DIR/.s" "$LOG_DIR/summary.log"
